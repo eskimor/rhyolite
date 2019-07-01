@@ -20,6 +20,7 @@
 
 module Rhyolite.Frontend.App where
 
+import Control.DeepSeq
 import Control.Monad.Exception
 import Control.Monad.Identity
 import Control.Monad.Primitive
@@ -39,6 +40,7 @@ import qualified Data.Map as Map
 import Data.Semigroup ((<>))
 import Data.Text (Text)
 import Data.Text.Encoding (decodeUtf8)
+import Debug.Trace (trace)
 import GHC.Generics (Generic)
 import Obelisk.Route.Frontend (Routed(..), SetRoute(..), RouteToUrl(..))
 import Network.URI (URI)
@@ -47,6 +49,9 @@ import Reflex.Dom.Core hiding (MonadWidget, Request, fmapMaybe)
 import Reflex.Host.Class
 import Reflex.Time (throttleBatchWithLag)
 import Reflex.FunctorMaybe
+{- import System.CPUTime (getCPUTime) -}
+import Data.Time.Clock (getCurrentTime, diffUTCTime, UTCTime)
+import System.IO.Unsafe (unsafePerformIO)
 
 import Rhyolite.Api
 import Rhyolite.App
@@ -366,6 +371,45 @@ data AppWebSocket t app = AppWebSocket
   , _appWebSocket_connected :: Dynamic t Bool
   }
 
+{-# NOINLINE unsafeGetTime #-}
+unsafeGetTime :: a -> (UTCTime, a)
+unsafeGetTime a = unsafePerformIO $ do
+  let getGetCurrentTime _ = a `seq` getCurrentTime
+  t <- getGetCurrentTime ()
+  pure (t, a)
+
+{- traceCallDuration :: String -> (b -> a) -> b -> a -}
+{- traceCallDuration name f v = -}
+{-   let -}
+{-     (t0, v0) = unsafeGetTime v -}
+{-     (t1, r) = unsafeGetTime $ f v -}
+{-   in -}
+{-     trace (name <> " took: " <> show  (t1 `diffUTCTime` t0) <> " seconds. ") r -}
+
+{-# NOINLINE traceCallDuration #-}
+traceCallDuration :: String -> (b -> a) -> b -> a
+traceCallDuration name f v = unsafePerformIO $ do
+  {- t0 <- v `seq` getCPUTime -}
+  t0 <- v `seq` getCurrentTime
+  let r = f v
+  t1 <- r `seq` getCurrentTime
+  putStrLn $ name <> " start time: " <> show t0
+  putStrLn $ name <> " end time: " <> show t1
+  putStrLn $ name <> " took: " <> show ((t1 `diffUTCTime` t0)) <> " seconds."
+  pure r
+
+{-# NOINLINE traceCallDurationDeep #-}
+traceCallDurationDeep :: (NFData a, NFData b) => String -> (b -> a) -> b -> a
+traceCallDurationDeep name f v = unsafePerformIO $ do
+  {- t0 <- v `seq` getCPUTime -}
+  t0 <- v `deepseq` getCurrentTime
+  let r = f v
+  t1 <- r `deepseq` getCurrentTime
+  putStrLn $ name <> " start time: " <> show t0
+  putStrLn $ name <> " end time: " <> show t1
+  putStrLn $ name <> " took: " <> show ((t1 `diffUTCTime` t0)) <> " seconds."
+  pure r
+
 -- | Open a websocket connection and split resulting incoming traffic into listen notification and api response channels
 openWebSocket' :: forall app t x m.
                  ( MonadJSM m
@@ -386,14 +430,20 @@ openWebSocket' :: forall app t x m.
               -> m (AppWebSocket t app)
 openWebSocket' url request vs = do
 #if defined(ghcjs_HOST_OS)
-  rec let platformDecode = jsonDecode . pFromJSVal
+  rec let
+          jsonDecodeTraced = traceCallDuration "jsonDecode" jsonDecode
+          pFromJSValTraced = traceCallDuration "pFromJSVal" pFromJSVal
+          platformDecode = traceCallDuration "platformDecode" (jsonDecodeTraced . pFromJSValTraced)
           rawWebSocket cfg = webSocket' url cfg (either (error "webSocket': expected JSVal") return)
       ws <- rawWebSocket $ def
 #else
-  rec let platformDecode = decodeValue' . LBS.fromStrict
+  rec let
+        decodeValue'Traced = traceCallDuration "decodeValue'" decodeValue'
+        fromStrictTraced = traceCallDuration "LBS.fromStrict" LBS.fromStrict
+        platformDecode = traceCallDuration "platformDecode" (decodeValue'Traced . fromStrictTraced)
       ws <- webSocket url $ def
 #endif
-        & webSocketConfig_send .~ fmap (map (decodeUtf8 . LBS.toStrict . encode)) (mconcat
+        & webSocketConfig_send .~ fmap (map (traceCallDuration "encode" (decodeUtf8 . LBS.toStrict . encode))) (mconcat
           [ fmap (map WebSocketRequest_Api) request
           , fmap ((:[]) . WebSocketRequest_ViewSelector) $ updated vs :: Event t [WebSocketRequest app (AppRequest app)]
           , tag (fmap ((:[]) . WebSocketRequest_ViewSelector) $ current vs) $ _webSocket_open ws

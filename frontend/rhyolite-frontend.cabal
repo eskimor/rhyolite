@@ -25,6 +25,7 @@ library
     , containers
     , cookie
     , data-default
+    , deepseq
     , dependent-map
     , dependent-sum
     , either
